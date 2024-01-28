@@ -15,18 +15,26 @@
  */
 package dev.morling.onebrc;
 
+import sun.misc.Unsafe;
+
 import java.io.*;
+import java.lang.foreign.Arena;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.lang.reflect.Field;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.concurrent.RecursiveTask;
 
 public class CalculateAverage_raipc {
     private static final String FILE = "./measurements.txt";
-    private static final int BUFFER_SIZE = 16 * 1024;
+    private static final int BUFFER_CAPACITY = 128 * 1024;
+    private static final int LINE_CAPACITY = 128;
 
     private static final class AggregatedMeasurement {
         final ByteArrayWrapper station;
@@ -71,11 +79,14 @@ public class CalculateAverage_raipc {
         }
     }
 
-    public static void main(String[] args) throws InterruptedException {
-        File inputFile = new File(FILE);
-        ParsingTask parsingTask = new ParsingTask(inputFile, 0, inputFile.length());
-        AggregatedMeasurement[] results = parsingTask.fork().join().toArray();
-        System.out.println(formatResult(results));
+    public static void main(String[] args) throws InterruptedException, IOException {
+        try (var channel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
+            var data = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size(), Arena.global());
+            ParsingTask parsingTask = new ParsingTask(data.address(), 0, data.byteSize(), data.byteSize());
+            AggregatedMeasurement[] results = parsingTask.invoke().toArray();
+            System.out.println(formatResult(results));
+        }
+
     }
 
     private static String formatResult(AggregatedMeasurement[] result) {
@@ -94,155 +105,96 @@ public class CalculateAverage_raipc {
     private static class ParsingTask extends RecursiveTask<MyHashMap> {
         private static final int SPLIT_FACTOR = 4;
         private static final int MIN_TASK_SIZE = 256 * 1024;
-        private final File file;
+        private final long mmapAddress;
         private final long startPosition;
         private final long endPosition;
+        private final long totalSize;
 
-        private ParsingTask(File file, long startPosition, long endPosition) {
-            this.file = file;
+        private ParsingTask(long mmapAddress, long startPosition, long endPosition, long totalSize) {
+            this.mmapAddress = mmapAddress;
             this.startPosition = startPosition;
             this.endPosition = endPosition;
+            this.totalSize = totalSize;
         }
 
         @Override
         protected MyHashMap compute() {
             long size = endPosition - startPosition;
-            if (size <= MIN_TASK_SIZE || size < file.length() / Runtime.getRuntime().availableProcessors() / SPLIT_FACTOR) {
-                return doCompute();
+            if (size <= MIN_TASK_SIZE || size < totalSize / Runtime.getRuntime().availableProcessors() / SPLIT_FACTOR) {
+                return parse();
             }
-            var firstHalf = new ParsingTask(file, startPosition, (startPosition + endPosition) / 2).fork();
-            var secondHalf = new ParsingTask(file, (startPosition + endPosition) / 2, endPosition).fork();
+            var firstHalf = new ParsingTask(mmapAddress, startPosition, (startPosition + endPosition) / 2, totalSize).fork();
+            var secondHalf = new ParsingTask(mmapAddress, (startPosition + endPosition) / 2, endPosition, totalSize).fork();
             var firstHalfResults = firstHalf.join();
             var secondHalfResults = secondHalf.join();
             firstHalfResults.merge(secondHalfResults);
             return firstHalfResults;
         }
 
-        private MyHashMap doCompute() {
-            try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
-                return new ParsingRoutine(startPosition, endPosition).parse(raf);
+        private MyHashMap parse() {
+            final long mmapAddress = this.mmapAddress;
+            final long mmapStartPosition = mmapAddress + startPosition;
+            final long mmapEndPosition = mmapAddress + endPosition;
+            final long mmapHardEndPosition = mmapAddress + Math.min(endPosition + LINE_CAPACITY, totalSize);
+
+            final MyHashMap result = new MyHashMap(2048);
+            byte[] buffer = new byte[BUFFER_CAPACITY];
+            final ByteArrayWrapper key = new ByteArrayWrapper(buffer, 0, 0, 0);
+
+            long mmapOffset = mmapStartPosition;
+            int length = Math.min(BUFFER_CAPACITY, (int) (mmapHardEndPosition - mmapOffset));
+            int bufferEnd = length;
+            UNSAFE.copyMemory(null, mmapOffset, buffer, Unsafe.ARRAY_BYTE_BASE_OFFSET, length);
+            int bufferOffset = 0;
+            int partialSize = 0;
+            if (startPosition > 0) {
+                bufferOffset = indexOf(buffer, '\n', 0, length) + 1;
             }
-            catch (IOException e) {
-                throw new UncheckedIOException(e);
-            }
-        }
-    }
-
-    private static class ParsingRoutine {
-        private final MyHashMap result = new MyHashMap(2048);
-        private final byte[] partialContentBuff = new byte[128];
-        private final ByteArrayWrapper reusableWrapper = new ByteArrayWrapper(partialContentBuff, 0, 0, 0);
-        private int partialSize;
-        private final long startPosition;
-        private final long endPosition;
-
-        private ParsingRoutine(long startPosition, long endPosition) {
-            this.startPosition = startPosition;
-            this.endPosition = endPosition;
-        }
-
-        private boolean hasPartialContent() {
-            return partialSize > 0;
-        }
-
-        MyHashMap parse(RandomAccessFile raf) throws IOException {
-            byte[] buffer = new byte[BUFFER_SIZE];
-            long offset = findStartOffset(raf, buffer);
-            boolean readMore = offset <= endPosition;
-            while (readMore) {
-                raf.seek(offset);
-                int length = raf.read(buffer);
-                if (length == -1) {
+            while (true) {
+                while (mmapOffset + bufferOffset <= mmapEndPosition) {
+                    int idxOfSemicolon = indexOf(buffer, ';', bufferOffset, bufferEnd);
+                    if (idxOfSemicolon >= 0) {
+                        int idxOfLf = indexOf(buffer, '\n', idxOfSemicolon + 2, Math.max(idxOfSemicolon + 2, bufferEnd));
+                        if (idxOfLf >= 0) {
+                            key.start = bufferOffset;
+                            key.length = idxOfSemicolon - bufferOffset;
+                            var aggregatedMeasurement = result.getOrCreate(key);
+                            aggregatedMeasurement.add(parseInt(buffer, idxOfSemicolon + 1, idxOfLf - 1));
+                            bufferOffset = idxOfLf + 1;
+                            continue;
+                        }
+                    }
+                    partialSize = bufferEnd - bufferOffset;
+                    if (partialSize > 0) {
+                        System.arraycopy(buffer, bufferOffset, buffer, 0, partialSize);
+                    }
                     break;
                 }
-                int bufStart = 0;
-                if (hasPartialContent()) {
-                    int idxOfLf = indexOf(buffer, '\n', 0, length);
-                    if (idxOfLf >= 0) {
-                        bufStart = idxOfLf + 1;
-                        System.arraycopy(buffer, 0, partialContentBuff, partialSize, bufStart);
-                        int toProcess = partialSize + bufStart;
-                        partialSize = 0;
-                        processPart(offset - toProcess, partialContentBuff, 0, toProcess);
-                    }
-                    else {
-                        System.arraycopy(buffer, 0, partialContentBuff, partialSize, bufStart);
-                        offset += length;
-                        continue;
-                    }
+
+                mmapOffset += length;
+                if (mmapOffset >= mmapEndPosition) {
+                    return result;
                 }
-                readMore = processPart(offset, buffer, bufStart, length);
-                offset += length;
+                length = Math.min(BUFFER_CAPACITY - partialSize, (int) (mmapHardEndPosition - mmapOffset));
+                UNSAFE.copyMemory(null, mmapOffset, buffer, Unsafe.ARRAY_BYTE_BASE_OFFSET + partialSize, length);
+                bufferOffset = 0;
+                bufferEnd = partialSize + length;
             }
-            return result;
         }
 
-        long findStartOffset(RandomAccessFile raf, byte[] buffer) throws IOException {
-            if (startPosition == 0) {
-                return 0;
-            }
-            long offset = startPosition - 1;
-            int length = 0;
-            int idxOfLf = -1;
-            while (offset < endPosition) {
-                raf.seek(offset);
-                length = raf.read(buffer);
-                if (length == -1) {
-                    throw new IllegalStateException("No content read on position " + offset);
-                }
-                offset += length;
-                idxOfLf = indexOf(buffer, '\n', 0, length);
-                if (idxOfLf >= 0) {
-                    break;
-                }
-            }
-            if (offset > startPosition) {
-                int start = idxOfLf + 1;
-                processPart(offset + start - length, buffer, start, length);
-            }
-            return offset;
-        }
-
-        boolean processPart(long position, byte[] buf, int start, int end) {
-            ByteArrayWrapper key = reusableWrapper;
-            key.content = buf;
-            while (position <= endPosition) {
-                int idxOfSemicolon = indexOf(buf, ';', start, end);
-                if (idxOfSemicolon >= 0) {
-                    int idxOfLf = indexOf(buf, '\n', idxOfSemicolon + 2, Math.max(idxOfSemicolon + 2, end));
-                    if (idxOfLf >= 0) {
-                        key.start = start;
-                        key.length = idxOfSemicolon - start;
-                        var aggregatedMeasurement = result.getOrCreate(key);
-                        aggregatedMeasurement.add(parseInt(buf, idxOfSemicolon + 1, idxOfLf - 1));
-                        int prevStart = start;
-                        start = idxOfLf + 1;
-                        position += start - prevStart;
-                        continue;
-                    }
-                }
-                partialSize = end - start;
-                if (partialSize > 0) {
-                    System.arraycopy(buf, start, partialContentBuff, 0, partialSize);
-                }
-                break;
-            }
-            return hasPartialContent() || position < endPosition;
-        }
-
-        private int parseInt(byte[] buf, int from, int toIncl) {
-            int mul = 1;
-            if (buf[from] == '-') {
-                mul = -1;
-                ++from;
-            }
-            int res = buf[toIncl] - '0';
-            int dec = 10;
-            for (int i = toIncl - 2; i >= from; --i) {
-                res += (buf[i] - '0') * dec;
-                dec *= 10;
-            }
-            return mul * res;
+        private static int parseInt(byte[] buf, int from, int toIncl) {
+             int mul = 1;
+             if (buf[from] == '-') {
+             mul = -1;
+             ++from;
+             }
+             int res = buf[toIncl] - '0';
+             int dec = 10;
+             for (int i = toIncl - 2; i >= from; --i) {
+             res += (buf[i] - '0') * dec;
+             dec *= 10;
+             }
+             return mul * res;
         }
     }
 
@@ -301,7 +253,7 @@ public class CalculateAverage_raipc {
     }
 
     private static class ByteArrayWrapper {
-        private byte[] content;
+        private final byte[] content;
         private int start;
         private int length;
         int hashCodeCached;
@@ -464,6 +416,19 @@ public class CalculateAverage_raipc {
                 }
             }
             return result;
+        }
+    }
+
+    private static final Unsafe UNSAFE = initUnsafe();
+
+    private static Unsafe initUnsafe() {
+        try {
+            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
+            theUnsafe.setAccessible(true);
+            return (Unsafe) theUnsafe.get(Unsafe.class);
+        }
+        catch (NoSuchFieldException | IllegalAccessException e) {
+            throw new RuntimeException(e);
         }
     }
 
